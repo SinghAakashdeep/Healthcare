@@ -1,4 +1,4 @@
-#🏥 Healthcare Vector DB App
+🏥 Healthcare Vector DB App
 
 A powerful and extensible Streamlit application for managing patient data and answering medical questions using vector search and LLMs (e.g., GPT-4o or LLaMA). Built with PostgreSQL, pgvector, and OpenAI (or alternative) API integration.
 
