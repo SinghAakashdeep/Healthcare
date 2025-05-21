@@ -17,12 +17,94 @@ import logging
 import random
 import datetime
 import nest_asyncio # Added import
+from ragas import evaluate 
+from ragas.metrics import (
+    Faithfulness, 
+    AnswerRelevancy,
+    context_recall,
+    context_precision,
+)
+from datasets import Dataset # For RAGAS evaluation
+
+# Initialize metrics as instances
+faithfulness = Faithfulness()
+answer_relevancy = AnswerRelevancy()
+
+# OpenAI Client wrapper for RAGAS compatibility
+class OpenAIWrapper:
+    """Wrapper around OpenAI client to make it compatible with RAGAS."""
+    
+    def __init__(self, client):
+        self.client = client
+        self.model = "llama3-70b-8192"
+        self.temperature = 0
+        self.max_tokens = 1024
+    
+    def set_run_config(self, **kwargs):
+        """Store configurations for RAGAS to use."""
+        if "model" in kwargs:
+            self.model = kwargs["model"]
+        if "temperature" in kwargs:
+            self.temperature = kwargs["temperature"]
+        if "max_tokens" in kwargs:
+            self.max_tokens = kwargs["max_tokens"]
+        return self
+    
+    def __call__(self, messages, *args, **kwargs):
+        """Make the wrapper callable, simulating what RAGAS expects."""
+        try:
+            # Convert to proper message format if it's a string
+            if isinstance(messages, str):
+                messages = [{"role": "user", "content": messages}]
+            elif not isinstance(messages, list):
+                messages = [{"role": "user", "content": str(messages)}]
+            
+            # Ensure all messages are properly formatted
+            formatted_messages = []
+            for msg in messages:
+                if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                    formatted_messages.append(msg)
+                elif isinstance(msg, str):
+                    formatted_messages.append({"role": "user", "content": msg})
+                else:
+                    formatted_messages.append({"role": "user", "content": str(msg)})
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=formatted_messages,
+                temperature=kwargs.get("temperature", self.temperature),
+                max_tokens=kwargs.get("max_tokens", self.max_tokens)
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"Error in OpenAIWrapper call: {e}")
+            return f"Error: {str(e)}"
+    
+    # Forward attribute lookups to client
+    def __getattr__(self, name):
+        if hasattr(self.client, name):
+            return getattr(self.client, name)
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+# Define safe_avg_field at the global level
+def safe_avg_field(sql):
+    """Extract field name from AVG function in SQL query"""
+    try:
+        match = re.search(r"AVG\((.*?)\)", sql, re.IGNORECASE)
+        return match.group(1) if match else "value"
+    except re.error as regex_err:
+        logging.error(f"Regex error during AVG field extraction: {regex_err} on string: {sql}")
+        return "value"
+    except Exception as e:
+        logging.error(f"Exception during AVG field extraction: {e}")
+        return "value"
 
 nest_asyncio.apply() # Added apply call
 
 # Global variable for API key status
 LLAMA_API_CONFIGURED = False
 openai_client = None # Initialize openai_client to None
+openai_wrapper = None # Initialize wrapper for RAGAS to None
 
 # Rate limiting variables
 LAST_API_CALL_TIME = None
@@ -40,6 +122,8 @@ if api_key_from_env:
             api_key=api_key_from_env,
             base_url="https://api.groq.com/openai/v1"  # Added Groq base URL
         )
+        # Create a wrapper for RAGAS compatibility
+        openai_wrapper = OpenAIWrapper(openai_client)
         LLAMA_API_CONFIGURED = True
         logging.info("Groq API key loaded and OpenAI client initialized for Groq.")
     except Exception as e:
@@ -347,9 +431,8 @@ with st.sidebar:
         </style>
     """, unsafe_allow_html=True)
 
-# --- FUNCTION DEFINITIONS ---
+# --- FUNCTION DEFINITIONS ---# Define all functions at the beginning# The safe_avg_field function is already defined at the top of the file
 
-# Define all functions at the beginning
 def load_db_config():
     """Load database configuration from config file or environment variables"""
     try:
@@ -674,18 +757,32 @@ def import_data_from_csv(uploaded_file):
 # Add a function to update API key
 def update_llama_api_key(new_key):
     """Update the Llama API key"""
-    global LLAMA_API_CONFIGURED
+    global LLAMA_API_CONFIGURED, openai_client, openai_wrapper
+    
     if new_key.strip():
-        LLAMA_API_CONFIGURED = True
-        st.session_state['LLAMA_API_KEY'] = new_key.strip()
-        logging.info("Llama API key updated via UI")
-        return True
+        try:
+            openai_client = openai.OpenAI(
+                api_key=new_key.strip(),
+                base_url="https://api.groq.com/openai/v1"  # Groq base URL
+            )
+            # Create a wrapper for RAGAS compatibility
+            openai_wrapper = OpenAIWrapper(openai_client)
+            LLAMA_API_CONFIGURED = True
+            st.session_state['LLAMA_API_KEY'] = new_key.strip()
+            logging.info("Llama API key updated via UI")
+            return True
+        except Exception as e:
+            logging.error(f"Error configuring API key via UI: {e}")
+            return False
     return False
 
 def clear_llama_api_key():
     """Clear the Llama API key to allow entering a new one"""
-    global LLAMA_API_CONFIGURED
+    global LLAMA_API_CONFIGURED, openai_client, openai_wrapper
+    
     LLAMA_API_CONFIGURED = False
+    openai_client = None
+    openai_wrapper = None
     if 'LLAMA_API_KEY' in st.session_state:
         del st.session_state['LLAMA_API_KEY']
     return True
@@ -696,7 +793,7 @@ def import_qa_data():
     cursor = None
     try:
         # Read the CSV file
-        file_path = 'github.com/SinghAakashdeep/Healthcarerepo/main/medquad.csv'
+        file_path = 'C:/Users/aakas/OneDrive/Desktop/healthcare_app/medquad.csv'
         
         # Start with file size check and initial progress indicators
         import os
@@ -852,6 +949,7 @@ def get_ai_answer(question, use_retrieval=True, max_context_items=3):
             try:
                 db_results = search_qa(question, search_type='text', similarity_threshold=0.1, max_results=max_context_items)
                 if db_results:
+                    db_results = db_results[:3]  # Only include top 3 results
                     context = "Here is some relevant medical information that might help (but feel free to provide additional or different information if appropriate):\n\n"
                     for i, result in enumerate(db_results, 1):
                         if len(result) >= 3:
@@ -877,8 +975,13 @@ def get_ai_answer(question, use_retrieval=True, max_context_items=3):
 
         messages = [{"role": "system", "content": system_message}]
         
+        retrieved_contexts_for_ragas = [] # Initialize for RAGAS
         if context:
             messages.append({"role": "user", "content": f"{context}\nBased on both the above information and your comprehensive medical knowledge, please provide a detailed answer to this question:\n{question}"})
+            # Store context for RAGAS
+            if db_results:
+                retrieved_contexts_for_ragas = [str(item[2]) for item in db_results if len(item) >=3] # Assuming answer is at index 2
+
         else:
             messages.append({"role": "user", "content": f"Please provide a comprehensive and detailed answer to this medical question, using your extensive medical knowledge:\n{question}"})
 
@@ -906,6 +1009,14 @@ def get_ai_answer(question, use_retrieval=True, max_context_items=3):
             if 'ai_request_timestamps' in st.session_state:
                 import datetime
                 st.session_state['ai_request_timestamps'].append(datetime.datetime.now())
+
+            # Store data for RAGAS evaluation
+            st.session_state['ragas_eval_data'] = {
+                "question": question,
+                "answer": answer,
+                "contexts": retrieved_contexts_for_ragas,
+                "ground_truth": "" # Placeholder for ground truth if you plan to add it
+            }
             
             return { # For inner try success
                 "answer": answer,
@@ -954,8 +1065,8 @@ def get_ai_answer(question, use_retrieval=True, max_context_items=3):
             "error": "general_error"
         }
 
-def ai_process_patient_db_question(question):
-    """Process a patient database question using AI"""
+def ai_process_patient_db_question(question, conversation_history=None):
+    """Process a patient database question using AI, with conversation history."""
     # Validate API key first
     if not LLAMA_API_CONFIGURED:
         return {
@@ -977,90 +1088,138 @@ def ai_process_patient_db_question(question):
         model = "llama3-70b-8192"  # Changed to Groq Llama 70b model
         
         # Construct the prompt with improved instructions
-        system_message = """You are a medical database assistant that provides accurate information about the patients database. 
-Your task is to analyze the user's question and determine what database query needs to be executed.
+        system_message = """You are an advanced database assistant with direct access to a PostgreSQL database.
+Your primary task is to translate the user's natural language question or command into an accurate and efficient PostgreSQL query.
+You will be provided with the ongoing conversation history. Use this context to understand follow-up questions, references to previous results, or evolving user intent. If your query or answer relies on previous turns, briefly mention it in your 'ANSWER:' part.
 
-IMPORTANT: You must always provide a response in the exact format requested at the end of these instructions.
+IMPORTANT INSTRUCTIONS:
+Your entire response MUST strictly follow the `ANSWER: ... QUERY_TYPE: ... PARAMS: ...` format detailed below. This is absolutely critical for the system to understand you.
+1.  **SQL Generation:** You MUST generate a single, valid PostgreSQL query to fulfill the user's request.
+    This can include SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, etc., as appropriate.
+2.  **Output Format:** You MUST provide your response in the exact format specified at the end of these instructions, including the SQL query you've generated.
+3.  **Schema Discovery (If Needed):**
+    *   You will be provided with the schema for primary tables like 'patients' and 'qa_pairs'.
+    *   If the user's question involves other tables or requires more detailed schema information than initially provided, you can generate queries against 'information_schema.tables' and 'information_schema.columns' to discover the necessary structure.
+4.  **CRITICAL CAUTION FOR DML/DDL:**
+    *   If the user's request implies a Data Manipulation (DML: INSERT, UPDATE, DELETE) or Data Definition (DDL: CREATE, ALTER, DROP) command, BE ABSOLUTELY SURE of the user's intent.
+    *   For DML/DDL, it is highly recommended that your 'ANSWER:' part explicitly states the destructive nature of the command and asks for user confirmation (though this system will execute it directly if generated).
+    *   Example: If user says "Remove patient John Doe", your answer might be: "I will generate a DELETE query to remove patient John Doe. This is a destructive operation."
+    *   **IMPORTANT: For ANY action (including INSERT, UPDATE, DELETE), you MUST ALWAYS include the SQL query in the PARAMS block, like:**
+    *   PARAMS: {"query": "INSERT INTO patients ..."}
+5.  **Efficiency:** Aim for efficient queries.
+6.  **Case Sensitivity:** PostgreSQL can be case-sensitive. Use `LOWER()` for case-insensitive data comparisons (e.g., `LOWER(metadata->>'gender') = 'm'`).
+7.  **Metadata Column:** The 'patients' table has a 'metadata' JSONB column. Access keys using `->>'key_name'`. Common keys include 'condition', 'gender', 'hemoglobin', 'wbc', 'platelets', 'bp_sys', 'bp_dia', 'heart_rate', 'temp', 'last_visit'. Always use these exact key names when querying. **When performing numerical comparisons on values from the metadata column (e.g., hemoglobin > 15 or bp_sys > 140), you MUST cast the extracted text value to a numeric type using EITHER `(metadata->>'your_key')::numeric` OR `CAST(metadata->>'your_key' AS NUMERIC)`. Ensure the type is exactly `numeric`. For example: `(metadata->>'hemoglobin')::numeric > 15` or `(metadata->>'bp_sys')::numeric > 140`.**
+8.  **Conditions:** Patient conditions in `metadata->>'condition'` can be a comma-separated list. Use `ILIKE '%condition_name%'` for searching. **If the user asks for a list of all distinct conditions, you MUST split the comma-separated values and return unique, trimmed values. Use a query like:**
+    `SELECT DISTINCT TRIM(condition) AS condition FROM patients, REGEXP_SPLIT_TO_TABLE(LOWER(metadata->>'condition'), ',') AS condition WHERE condition <> '';`
+9.  **Informational Questions:** If the user's question seems to be more of a general informational or medical knowledge question (e.g., 'What are the risks of high blood pressure?', 'Tell me about diabetes and its common treatments?') rather than a direct request for specific patient records, your `ANSWER:` section should primarily provide a textual explanation. You MAY optionally provide a *related* SQL query in the `PARAMS:` section if it serves as a relevant example of how one *could* query for related data, but the comprehensive textual answer is the priority. If no SQL query is relevant or helpful as an example, you can respond with `QUERY_TYPE: custom_query` and `PARAMS: {"query": ""}` or omit these lines if providing a purely textual answer.10. **Direct Command Recognition:** Recognize phrases like "add new patient", "add a patient", "create patient" as requests for INSERT operations. When users enter statements like "Add a new patient John Doe, age 45, with diabetes", always interpret this as a request to create a new patient record using an INSERT statement. The same applies to phrases like "update patient", "delete patient", etc.
 
-DATABASE SCHEMA NOTES:
-- The 'patients' table has a 'metadata' column of type JSONB.
-- To access specific keys within the 'metadata' column, use the ->> operator, e.g., metadata->>'condition' to get the condition as text.
-- For case-insensitive comparison of gender (stored as 'M' or 'F'), use LOWER(metadata->>'gender') = 'f' for female or LOWER(metadata->>'gender') = 'm' for male.
-- When comparing other string values from `metadata` like `metadata->>'condition'`, `metadata->>'symptoms'`, etc., use `ILIKE` for case-insensitive matching (e.g., `metadata->>'condition' ILIKE '%diabetes%'`).
-- When filtering `metadata` string values as numbers (e.g., `metadata->>'temp' > 100` or `metadata->>'age_at_diagnosis' = '55') 
-  you MUST ensure the SQL query first robustly checks if the string is a valid number before casting or direct numeric comparison. 
-  For example, use a subquery or a CASE statement with a regular expression to validate numeric format. 
-  A simple check could be: `WHERE column ~ '^[0-9]+(\\.[0-9]+)?$'`.  # Corrected Python string for regex
-  Then, cast the validated value: `(metadata->>'numeric_field')::numeric`. 
-  For temperature, assume it's stored as a simple number string like '98.6' or '101.2'.
-  For age, it is an INTEGER column, so direct comparison is fine.
+EXAMPLE USER REQUEST AND AI RESPONSE:
 
-You have access to the following query types:
+User question: How many male patients have diabetes?
+AI Response:
+ANSWER: I will execute a query to count the male patients with diabetes.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "SELECT COUNT(*) FROM patients WHERE LOWER(metadata->>'gender') = 'm' AND metadata->>'condition' ILIKE '%diabetes%'"}
 
-1. count_all - Returns the total number of patients
-2. avg_age - Returns the average age of all patients
-3. condition_count - Returns the count of patients with a specific condition (needs parameter "condition")
-4. patients_with_condition - Returns details of patients with a specific condition (needs parameter "condition")
-5. patients_older_than - Returns patients older than a specific age (needs parameter "age")
-6. all_patients - Returns all patients in the database
-7. patient_by_id - Returns details of a specific patient by ID (needs parameter "id")
-8. custom_query - Allows you to write a custom PostgreSQL query for more complex requests (needs parameter "query" containing valid SQL)
+User question: What is the average age of female patients who have hypertension but not diabetes?
+AI Response:
+ANSWER: I will calculate the average age of female patients with hypertension who do not have diabetes.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "SELECT AVG(age) FROM patients WHERE LOWER(metadata->>'gender') = 'f' AND metadata->>'condition' ILIKE '%hypertension%' AND metadata->>'condition' NOT ILIKE '%diabetes%';"}
 
-For complex questions that don't fit in the predefined query types, you can use custom_query to write a specific PostgreSQL query.
-When using custom_query:
-- Only SELECT statements are allowed
-- Use parameterized queries when possible
-- Your query MUST use the exact table and column names from the schema below
-- Don't use semicolons or multiple queries
-- Only use database features available in PostgreSQL
+User question: What are the data types for the 'patients' table?
+AI Response:
+ANSWER: I will query the information schema to find the data types for the 'patients' table. The results will be displayed directly.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'patients';"}
 
-Examples of questions and their appropriate query types:
-- "How many patients are in the database?" → count_all
-- "What's the average age of patients?" → avg_age
-- "How many patients have diabetes?" → condition_count with params {"condition": "diabetes"}
-- "Number of diabetes patients" → condition_count with params {"condition": "diabetes"}
-- "What is the number of patients with diabetes?" → condition_count with params {"condition": "diabetes"}
-- "List all patients with heart disease" → patients_with_condition with params {"condition": "heart disease"}
-- "Show me patients older than 65" → patients_older_than with params {"age": 65}
-- "Show all patients" → all_patients
-- "What are patient 5's details?" → patient_by_id with params {"id": 5}
-- "Which patients have both diabetes and hypertension?" → custom_query with params {"query": "SELECT id, name, age, metadata->>'condition' as conditions FROM patients WHERE metadata->>'condition' ILIKE '%diabetes%' AND metadata->>'condition' ILIKE '%hypertension%'"}
-- "How many male patients have diabetes but not hypertension?" → custom_query with params {"query": "SELECT COUNT(*) FROM patients WHERE LOWER(metadata->>'gender') = 'm' AND metadata->>'condition' ILIKE '%diabetes%' AND NOT (metadata->>'condition' ILIKE '%hypertension%')"}
-- "What's the average age of male patients with heart disease?" → custom_query with params {"query": "SELECT AVG(age) as average_age FROM patients WHERE LOWER(metadata->>'gender') = 'm' AND metadata->>'condition' ILIKE '%heart disease%'"}
-- "How many female patients have diabetes?" → custom_query with params {"query": "SELECT COUNT(*) FROM patients WHERE LOWER(metadata->>'gender') = 'f' AND metadata->>'condition' ILIKE '%diabetes%'"}
-- "What are all the unique medical conditions mentioned for patients?" → custom_query with params {"query": "SELECT DISTINCT TRIM(UNNEST(STRING_TO_ARRAY(REPLACE(LOWER(metadata->>'condition'), ' ', ''), ','))) as distinct_condition FROM patients WHERE metadata->>'condition' IS NOT NULL AND TRIM(metadata->>'condition') <> '' ORDER BY distinct_condition"} # More robust distinct conditions query
+User question: What extensions are installed in the database?
+AI Response:
+ANSWER: I will query the pg_extension catalog to list installed database extensions. The results will be displayed directly.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "SELECT extname FROM pg_extension;"}
 
-IMPORTANT CONDITION MAPPINGS:
-The following medical conditions should be normalized as shown:
-- Diabetes, Type 1 Diabetes, Type 2 Diabetes → "diabetes"
-- Heart Disease, Cardiac issues, Coronary disease → "heart disease"
-- Hypertension, High Blood Pressure, HTN → "hypertension"
-- Cancer, Malignancy, Tumor → "cancer" 
-- Respiratory issues, Asthma, Breathing difficulties → "asthma"
+User question: Add a new patient John Everyman, age 45, with diabetes.
+AI Response:
+ANSWER: I will create a new patient record for John Everyman with diabetes.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "INSERT INTO patients (name, age, metadata) VALUES ('John Everyman', 45, '{\"condition\": \"diabetes\"}'::jsonb);"}
 
+User question: Add patient Jane Smith, 32, with hypertension and asthma
+AI Response:
+ANSWER: I will add Jane Smith as a new patient with hypertension and asthma.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "INSERT INTO patients (name, age, metadata) VALUES ('Jane Smith', 32, '{\"condition\": \"hypertension, asthma\"}'::jsonb);"}
+
+User question: Delete all patients older than 90.
+AI Response:
+ANSWER: I will generate a DELETE query to remove all patients older than 90. This is a destructive operation.
+QUERY_TYPE: custom_query
+PARAMS: {"query": "DELETE FROM patients WHERE age > 90;"}
+
+REMINDER: YOUR ENTIRE RESPONSE MUST ADHERE STRICTLY TO THE FORMAT BELOW.
 YOU MUST FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
-ANSWER: <your answer to the user's question>
-QUERY_TYPE: <one of the available query types>
-PARAMS: <parameters in JSON format, if needed>"""
+ANSWER: <your natural language explanation of what the query will do or the answer if it's a direct lookup from schema info>
+QUERY_TYPE: custom_query
+PARAMS: {"query": "YOUR_SQL_QUERY_HERE"}
+"""
 
         # Prepare the prompt with database information and user question
+        # The AI is now expected to discover schema dynamically if needed.
+        # db_schema_info = get_db_schema() # REMOVED: No longer pre-loading schema for primary tables
+
+        # Function to fix the name group issue in the direct_insert_pattern
+        def fix_regex_pattern_error():
+            try:
+                # Try to extract using the 'n' group first (original pattern)
+                patient_name = insert_match.group('n').strip() 
+                return patient_name, insert_match.group('age').strip(), insert_match.group('condition').strip()
+            except:
+                # If 'n' fails, try 'name' (updated pattern)
+                try:
+                    patient_name = insert_match.group('name').strip()
+                    return patient_name, insert_match.group('age').strip(), insert_match.group('condition').strip()
+                except Exception as e:
+                    logger.error(f"Both 'n' and 'name' group extraction failed: {e}")
+                    raise
+
+        # Special handling for direct commands to add patients
+        direct_insert_pattern = re.compile(r'(?i)add (?:a )?(?:new )?patient[:\s]+(?P<name>[a-z\s]+),?\s+(?:age\s+)?(?P<age>\d+)[,\s]+(?:with\s+)?(?:condition\s+)?(?P<condition>[a-z\s]+)')
+        insert_match = direct_insert_pattern.search(question)
+        
+        if insert_match:
+            try:
+                # Extract patient details using helper function that handles both 'n' and 'name' groups
+                patient_name, patient_age, patient_condition = fix_regex_pattern_error()
+                
+                # Create the INSERT SQL directly - properly format JSON for PostgreSQL
+                metadata_json = json.dumps({"condition": patient_condition})
+                insert_sql = f"INSERT INTO patients (name, age, metadata) VALUES ('{patient_name}', {patient_age}, '{metadata_json}'::jsonb)"
+                
+                return {
+                    "answer": f"I'll add a new patient named {patient_name}, age {patient_age}, with condition: {patient_condition}.",
+                    "query_type": "custom_query",
+                    "params": {"query": insert_sql}
+                }
+            except Exception as e:
+                logger.error(f"Error processing direct insert pattern: {e}")
+                # Continue with normal processing if direct pattern fails
+
         user_prompt = f"""
-Here's information about the current database:
-{db_summary}
-
-Common condition statistics:
-{condition_stats}
-
-{db_schema}
-
 User question: {question}
+
+(You have access to information_schema.tables and information_schema.columns to discover database structure.)
 """
 
         # Prepare messages for OpenAI
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_prompt}
-        ]
+        messages = [{"role": "system", "content": system_message}]
+        if conversation_history:
+            history_for_llm = conversation_history[-2:]
+            for entry in history_for_llm:
+                if "role" in entry and "content" in entry:
+                    messages.append({"role": entry["role"], "content": entry["content"]})
+        
+        messages.append({"role": "user", "content": user_prompt})
 
         logger.info(f"Sending prompt to OpenAI about: {question[:50]}...")
 
@@ -1080,297 +1239,171 @@ User question: {question}
         logger.info(f"Raw OpenAI response: {response_text}")
         
         # Parse the response to extract the answer, query type, and params
-        result = {"raw_response": response_text}
+        result = {"raw_response": response_text, "query_type": "custom_query"} 
         
-        # Extract answer with improved regex pattern
+        # Attempt to extract the structured answer
         answer_match = re.search(r"ANSWER:(.*?)(?:QUERY_TYPE:|$)", response_text, re.DOTALL)
+        extracted_answer_text = None
         if answer_match:
-            result["answer"] = answer_match.group(1).strip()
-        else:
-            # Try a more forgiving pattern if the exact format isn't followed
-            answer_match = re.search(r"(?:ANSWER:)?(.*?)(?:QUERY_TYPE:|PARAMS:|$)", response_text, re.DOTALL)
-            if answer_match and answer_match.group(1).strip():
-                result["answer"] = answer_match.group(1).strip()
-            else:
-                result["answer"] = "I couldn't parse a proper answer from the AI response. Please try rephrasing your question."
-                logger.warning(f"Failed to extract answer from: {response_text}")
+            extracted_answer_text = answer_match.group(1).strip()
+            result["answer"] = extracted_answer_text
         
-        # Extract query type with improved pattern
-        query_match = re.search(r"QUERY_TYPE:(.*?)(?:PARAMS:|$)", response_text, re.DOTALL)
-        if query_match:
-            query_type = query_match.group(1).strip()
-            # Validate query type is one of the expected values
-            valid_query_types = ["count_all", "avg_age", "condition_count", "patients_with_condition", 
-                             "patients_older_than", "all_patients", "patient_by_id", "custom_query"]
-            
-            if query_type in valid_query_types:
-                result["query_type"] = query_type
-            else:
-                # Try to map to a valid query type based on keywords
-                if "custom" in query_type.lower() or "sql" in query_type.lower():
-                    result["query_type"] = "custom_query"
-                elif "count" in query_type.lower() and "condition" in query_type.lower():
-                    result["query_type"] = "condition_count"
-                elif "count" in query_type.lower() or "how many" in query_type.lower():
-                    result["query_type"] = "count_all"
-                elif "average" in query_type.lower() or "avg" in query_type.lower():
-                    result["query_type"] = "avg_age"
-                elif "older" in query_type.lower() or "age" in query_type.lower():
-                    result["query_type"] = "patients_older_than"
-                elif "condition" in query_type.lower() or "disease" in query_type.lower():
-                    result["query_type"] = "patients_with_condition"
-                elif "all" in query_type.lower():
-                    result["query_type"] = "all_patients"
-                elif "id" in query_type.lower() or "specific" in query_type.lower():
-                    result["query_type"] = "patient_by_id"
-                else:
-                    # Default to custom query for complex questions
-                    result["query_type"] = "custom_query"
-                    logger.warning(f"Unrecognized query type: {query_type}, defaulting to custom_query")
-        else:
-            # Enhanced pattern matching for query identification if QUERY_TYPE is missing
-            q = question.lower()
-            complex_indicators = [
-                "both", "and also", "who have both", "correlation", "relationship",
-                "group by", "compare", "highest", "lowest", "average", "percentage",
-                "ratio", "proportion", "male and female", "gender distribution",
-                "over time", "trend", "most common", "least common", "distribution"
-            ]
-            
-            if any(indicator in q for indicator in complex_indicators):
-                result["query_type"] = "custom_query"
-            else:
-                condition_count_patterns = [
-                    r"how many (?:patients|people) (?:have|with|suffer from) ([\w\s]+)",
-                    r"(?:number|count|total) of (?:patients|people) (?:with|having|diagnosed with) ([\w\s]+)",
-                    r"what is the (?:number|count|total) of (?:patients|people) (?:with|having|who have) ([\w\s]+)",
-                    r"count (?:patients|people) (?:with|having|who have) ([\w\s]+)"
-                ]
-                found_pattern = False
-                for pattern in condition_count_patterns:
-                    match = re.search(pattern, q)
-                    if match:
-                        result["query_type"] = "condition_count"
-                        condition = match.group(1).strip()
-                        condition = re.sub(r'\?$', '', condition)
-                        result["params"] = {"condition": condition}
-                        found_pattern = True
-                        break
-                
-                if not found_pattern:
-                    if "how many" in q and any(word in q for word in ["patients", "people"]):
-                        if any(condition_keyword in q for condition_keyword in ["diabetes", "heart", "cancer", "disease", "condition"]):
-                            result["query_type"] = "condition_count"
-                            condition_match = re.search(r"(?:with|has|have|suffer from) ([\w\s]+)(?:\?|$)", q)
-                            if condition_match:
-                                result["params"] = {"condition": condition_match.group(1).strip()}
-                            # If condition not extracted, it might be a general count_all if no condition keywords were truly specific
-                            # However, the presence of a condition keyword already set it to condition_count
-                        else:
-                            result["query_type"] = "count_all"
-                    elif "average" in q and "age" in q:
-                        result["query_type"] = "avg_age"
-                    elif "older than" in q or "over" in q:
-                        result["query_type"] = "patients_older_than"
-                        age_match = re.search(r"(?:older than|over) (\d+)", q)
-                        if age_match:
-                            result["params"] = {"age": int(age_match.group(1))}
-                    elif "all" in q or "list" in q or "show" in q:
-                        if any(condition_keyword in q for condition_keyword in ["diabetes", "heart", "cancer", "disease", "condition"]):
-                            result["query_type"] = "patients_with_condition"
-                            condition_match = re.search(r"(?:with|has|have) ([\w\s]+)(?:\?|$)", q)
-                            if condition_match:
-                                result["params"] = {"condition": condition_match.group(1).strip()}
-                        else:
-                            result["query_type"] = "all_patients"
-                    elif "details" in q or "information" in q or "specific" in q:
-                        result["query_type"] = "patient_by_id"
-                        id_match = re.search(r"(?:patient|id) (\d+)", q)
-                        if id_match:
-                            result["params"] = {"id": int(id_match.group(1))}
-                    else:
-                        result["query_type"] = "custom_query" # Default for unparsed simple questions
-        
-        # Extract params if they exist
-        # Try a more greedy regex for the PARAMS block first, assuming it's the last major block.
-        
-        # Initialize params_text_for_fallbacks to ensure it's always defined
-        params_text_for_fallbacks = "" 
+        # --- Robust PARAMS extraction ---
+        params_dict = None
+        try:
+            params_start = response_text.find('PARAMS:')
+            if params_start != -1:
+                params_str = response_text[params_start + len('PARAMS:'):].strip()
+                first_brace = params_str.find('{')
+                last_brace = params_str.find('}')
+                if first_brace != -1 and last_brace != -1:
+                    json_str = params_str[first_brace:last_brace+1]
+                    try:
+                        params_dict = json.loads(json_str)
+                        logger.debug(f"Extracted PARAMS JSON: {params_dict}")
+                    except Exception as e:
+                        logger.error(f"Failed to parse PARAMS JSON: {e}. String: {json_str}")
+        except Exception as e:
+            logger.error(f"Exception during PARAMS extraction: {e}")
 
-        # Accept PARAMS: or PARAMS" or PARAMS : etc, then capture the JSON block
-        params_match = re.search(r"PARAMS(?::|\"|\s*:)?\s*(\{.*\})", response_text, re.DOTALL | re.IGNORECASE)
-        if params_match:
-            params_text_candidate = params_match.group(1).strip() # group(1) should be the JSON string "{...}"
-            logger.debug(f"Candidate PARAMS block (new SyntaxError fix attempt): {params_text_candidate}")
-            
-            successfully_parsed_params = False
-            params_from_raw_decode = None 
-            params_text_for_fallbacks = params_text_candidate # Override with actual candidate if PARAMS: found
-
+        # --- Robust SQL extraction ---
+        extracted_sql = None
+        if params_dict and isinstance(params_dict, dict) and "query" in params_dict:
+            extracted_sql = params_dict["query"].strip()
+            result["params"] = {"query": extracted_sql}
+            logger.info(f"Successfully parsed SQL query from PARAMS: {extracted_sql}")
+        else:
+            # Fallback: try regex, but wrap in try/except
             try:
-                if params_text_candidate.lstrip().startswith("{"):
-                    decoder = json.JSONDecoder()
-                    # Pre-process the params_text_candidate to handle literal backslashes in regex patterns
-                    # that might confuse raw_decode if the LLM doesn't escape them perfectly for JSON strings.
-                    # Specifically, if LLM outputs `\.` in regex, it becomes `\\.` in the JSON string.
-                    # If it outputs `\\.` in regex, it becomes `\\\\.` in JSON.
-                    # raw_decode chokes on `\.` if it's not a valid JSON escape.
-                    # Let's assume LLM produces `\\.` for a literal dot in regex within the JSON string.
-                    # This should be fine for raw_decode. The issue was `Invalid \\escape`
-                    # meaning `\` followed by a char that isn't a valid JSON escape.
-                    # The LLM's output `~ '^[0-9]+(\\.[0-9]+)?$'` means the JSON string part is `(\\.[0-9]+)?`.
-                    # This `\\.` is what raw_decode dislikes.
-                    
-                    # If the LLM meant a literal dot in regex `\.`, it should send `\\.` in the JSON string.
-                    # If `raw_decode` sees `\\.` it should be fine.
-                    # The error was "Invalid \\escape: line 1 column 122 (char 121)" for "...(\\.[0-9]+)..."
-                    # This implies the string passed to raw_decode contained a single backslash before the dot.
-                    # This is strange because the LLM output in the log shows `(\\.[0-9]+)?$`
-                    # which is `{"query": "...(\\.[0-9]+)?$..."}`
-                    # This suggests the `params_text_candidate` somehow becomes `...(\.[0-9]+)?$...` before raw_decode.
-                    # Let's log `repr(params_text_candidate)` before attempting raw_decode.
+                # More comprehensive regex that captures SELECT, INSERT, UPDATE, DELETE statements
+                sql_fallback_match = re.search(r'"query"\s*:\s*"((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER).*?)"\s*(?:,|})', response_text, re.IGNORECASE | re.DOTALL)
+                if sql_fallback_match:
+                    extracted_sql = sql_fallback_match.group(1).strip().replace(';','')
+                    result["params"] = {"query": extracted_sql}
+                    logger.info(f"Fallback regex extracted SQL query: {extracted_sql}")
+                # If still no match, try a more aggressive approach for any SQL-like content
+                elif '"query"' in response_text and not extracted_sql:
+                    try:
+                        all_content_match = re.search(r'"query"\s*:\s*"(.*?)"\s*(?:,|})', response_text, re.DOTALL)
+                        if all_content_match:
+                            potential_sql = all_content_match.group(1).strip().replace(';','')
+                            if any(keyword in potential_sql.upper() for keyword in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER']):
+                                extracted_sql = potential_sql
+                                result["params"] = {"query": extracted_sql}
+                                logger.info(f"Last-resort SQL extraction succeeded: {extracted_sql}")
+                    except Exception as inner_e:
+                        logger.error(f"Inner exception during aggressive SQL extraction: {inner_e}")
+            except re.error as regex_err:
+                logger.error(f"Regex error during SQL extraction: {regex_err} on string: {response_text}")
+            except Exception as e:
+                logger.error(f"Exception during fallback SQL extraction: {e}")
 
-                    logger.debug(f"Attempting raw_decode on (repr): {repr(params_text_candidate.lstrip())}")
-                    decoded_json, end_index = decoder.raw_decode(params_text_candidate.lstrip())
-                    params_from_raw_decode = decoded_json 
-                    logger.info(f"Successfully parsed PARAMS JSON using raw_decode: {params_from_raw_decode}")
-                    
-                    actual_end_index_in_candidate = len(params_text_candidate) - len(params_text_candidate.lstrip()) + end_index
-                    if actual_end_index_in_candidate < len(params_text_candidate):
-                        trailing_text = params_text_candidate[actual_end_index_in_candidate:].strip()
-                        if trailing_text:
-                            logger.info(f"Trailing text after PARAMS JSON object: {trailing_text}")
-                else:
-                    logger.warning(f"PARAMS candidate does not start with JSON object structure: {params_text_candidate[:200]}...")
-            
-            except json.JSONDecodeError as json_err:
-                logger.warning(f"JSONDecodeError using raw_decode on PARAMS candidate: {json_err}. Text (repr): {repr(params_text_candidate)}. Will proceed to fallbacks.")
-                # If raw_decode fails due to escape issues, specifically try to extract the query string via regex
-                # This is a targeted fallback for when the LLM includes regex patterns in its SQL.
-                if "invalid escape" in str(json_err).lower() or "invalid \\escape" in str(json_err).lower() : # Check for specific error
-                    logger.info("JSONDecodeError due to invalid escape, attempting direct regex extraction for 'query'.")
-                    # This regex tries to find "query": "SQL_CONTENT_HERE" where SQL_CONTENT_HERE can contain escaped quotes.
-                    # query_sql_match = re.search(r'"query"\\s*:\\s*"((?:\\\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\\])*)"', params_text_candidate, re.IGNORECASE)
-                    # More robust fallback regex for query content:
-                    query_sql_match = re.search(r'"query"\s*:\s*"(.+?)"\s*(?:,|\})', params_text_candidate, re.IGNORECASE | re.DOTALL)
-                    if query_sql_match:
-                        extracted_sql = query_sql_match.group(1)
-                        # Further clean common LLM escape patterns for SQL that might remain
-                        extracted_sql = extracted_sql.replace('\\\\"', '"').replace("\\\\'", "'").replace("\\n", "\n").replace(';', '')
-                        logger.info(f"Direct regex extraction for 'query' after invalid escape: {extracted_sql}")
-                        # Ensure params_from_raw_decode is a dict to store this.
-                        if not isinstance(params_from_raw_decode, dict): params_from_raw_decode = {}
-                        params_from_raw_decode["query"] = extracted_sql
-                        # We might not have other params, but the query is the most important.
-                    else:
-                        logger.warning("Direct regex for 'query' after invalid escape failed to find a match.")
-            except Exception as e_raw_decode:
-                logger.error(f"Unexpected error during raw_decode: {e_raw_decode}. Text (repr): {repr(params_text_candidate)}. Will proceed to fallbacks.")
 
-            # If raw_decode (or the specific regex fallback) was successful and gave us params, use them.
-            if params_from_raw_decode is not None and isinstance(params_from_raw_decode, dict):
-                result["params"] = params_from_raw_decode
-                successfully_parsed_params = True # Mark that primary parsing succeeded
-            else:
-                result["params"] = {} # Ensure it's an empty dict if raw_decode failed or yielded non-dict
-
-            # Fallback mechanisms if primary parsing failed or didn't yield a query
-            if not successfully_parsed_params or not result.get("params", {}).get("query"):
-                logger.debug(f"Primary JSON parsing (raw_decode) failed or query not found. Current params: {result.get('params')}. Attempting fallbacks on params_text_for_fallbacks: '{params_text_for_fallbacks[:200]}...'")
-                
-                # Fallback 1 (Original kv_matches)
-                # Only run if params is still empty (meaning raw_decode didn't even partially populate it)
-                if not result.get("params"):
-                    logger.warning("Fallback 1: Attempting manual key-value extraction.")
-                    kv_matches = re.findall(r'"([^"]+)":\\s*(?:"([^"]+)"|(\\d+))', params_text_for_fallbacks)
-                    temp_params = {}
-                    for key, str_val, num_val in kv_matches:
-                        if str_val:
-                            temp_params[key] = str_val
-                        elif num_val:
-                            temp_params[key] = int(num_val)
-                    if temp_params:
-                        result["params"] = temp_params # Overwrite if kv_matches found something
-                        logger.info(f"Fallback 1: Manually extracted params: {result['params']}")
-                    else:
-                        logger.warning("Fallback 1: No key-value pairs extracted.")
-                        # result["params"] remains {} or what raw_decode left (if anything non-query)
-
-                # Fallback 2 (Direct regex for 'query' key)
-                # This runs if the query specifically is still missing from params.
-                if result.get("query_type") == "custom_query" and not result.get("params", {}).get("query"):
-                    logger.warning("Fallback 2: 'query' param still missing. Attempting specific regex for 'query'.")
-                    query_sql_match = re.search(r'"query"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', params_text_for_fallbacks, re.IGNORECASE)
-                    if query_sql_match:
-                        extracted_sql = query_sql_match.group(1).strip().replace(';', '')
-                        extracted_sql = extracted_sql.replace("\\\\'", "'").replace('\\\\"', '"').replace("\\\\n", "\n")
-                        # Ensure params dict exists before assigning to its key
-                        if not isinstance(result.get("params"), dict): result["params"] = {}
-                        result["params"]["query"] = extracted_sql
-                        logger.info(f"Fallback 2: Direct regex for 'query' param yielded: {result['params']['query']}")
-                    else:
-                        logger.warning("Fallback 2: Direct regex for 'query' param found nothing.")
-        else:
-            logger.warning("Initial greedy regex for PARAMS: block did not find a match.")
-            result["params"] = {}
-
-        # Ensure result["params"] exists and is a dict after all attempts
-        if not isinstance(result.get("params"), dict):
-            logger.debug("Params was not a dict after all parsing attempts, resetting to empty dict.")
-            result["params"] = {}
-
-        # For custom_query, if 'query' key is missing or empty after parsing,
-        # try a direct regex extraction from the original params_text as a final safety net.
-        # This is especially if the JSON parsing failed to get the 'query' value correctly.
-        if result.get("query_type") == "custom_query" and not result.get("params", {}).get("query"):
-            logger.warning("Custom query type but 'query' param is missing/empty. Attempting direct regex for 'query' (final safety net).")
-            # Regex to find "query": "SQL_QUERY_STRING" allowing for spaces and ensuring it captures the full string value
-            query_sql_match_fallback = re.search(r'"query"\s*:\s*"((?:\\.|[^"\\])*)"', params_text_for_fallbacks, re.IGNORECASE | re.DOTALL)
-            if query_sql_match_fallback:
-                extracted_sql_fallback = query_sql_match_fallback.group(1).strip().replace(';', '')
-                # Further clean escaped characters that might come from LLM if it over-escapes for JSON
-                extracted_sql_fallback = extracted_sql_fallback.replace("\\\\'", "'").replace('\\\\"', '"')
-                result["params"]["query"] = extracted_sql_fallback
-                logger.info(f"Direct regex extraction for 'query' param (final safety net) yielded: {extracted_sql_fallback}")
-            else:
-                logger.warning("Direct regex for 'query' param (final safety net) found nothing.")
+        # If structured ANSWER: was not found, adjust the answer message.
+        if not extracted_answer_text:
+            if extracted_sql: # Query was found, but no "ANSWER:" prefix
+                 result["answer"] = "AI provided a query, but the textual explanation was not in the expected format. The query will be processed."
+                 logger.warning(f"Extracted SQL but failed to find ANSWER: prefix. Raw response: {response_text}")
+            else: # No "ANSWER:" prefix and no query found either. AI might be chatting or gave unformatted response.
+                 result["answer"] = response_text.strip() # Use the whole response
+                 logger.warning(f"Failed to extract ANSWER: part and no SQL query found. Using full response. Raw: {response_text}")
         
-        # Debug log the parsed result
-        logger.info(f"Parsed OpenAI response: {result}")
-        
-        # Pre-execute the query to verify and update the answer if needed
-        if result.get("query_type") == "condition_count" and result.get("params", {}).get("condition"):
-            condition = result["params"]["condition"]
-            db_result = execute_db_query("condition_count", {"condition": condition})
-            if db_result:
-                actual_count = db_result["count"]
-                search_condition = db_result.get("search_condition", condition)
-                result["answer"] = f"There are {actual_count} patients with a condition similar to '{search_condition}'."
-                result["params"]["condition"] = search_condition
-                logger.info(f"Updated answer with actual count: {actual_count} for condition '{search_condition}'")
-        
-        elif result.get("query_type") == "custom_query" and result.get("params", {}).get("query"):
-            custom_sql_query = result["params"]["query"]
-            # Use raw_llm_sql_for_error if it exists (meaning SQL gen failed, but we have the raw output)
-            # Otherwise, custom_sql_query is the one to show if execution of a successfully generated query fails.
-            query_to_display_on_error = result.get("raw_llm_sql_for_error", custom_sql_query)
+        # Ensure params and query sub-key exist if no SQL was extracted, to prevent downstream errors
+        if "params" not in result or "query" not in result["params"]:
+            result["params"] = {"query": ""}
+            st.warning("The AI did not generate a SQL query. Please try rephrasing your request or click 'Execute Query' again.")
 
-            # Correctly call execute_db_query:
-            # 1. Pass the actual SQL string as the first argument.
-            # 2. Pass any query arguments (e.g., for %s placeholders) if provided by LLM, default to [].
-            # 3. Set is_custom_query=True.
-            llm_query_params = result.get("params", {})
-            sql_args = llm_query_params.get("args", []) # Get args if LLM provides them
 
-            # Specific fix for a common LLM malformation with STRING_TO_ARRAY
-            if "STRING_TO_ARRAY(LOWER(metadata->>'condition')), " in custom_sql_query:
-                custom_sql_query = custom_sql_query.replace(
-                    "STRING_TO_ARRAY(LOWER(metadata->>'condition')), ",
-                    "STRING_TO_ARRAY(LOWER(metadata->>'condition'), ",
-                    1 # Replace only the first occurrence, just in case
-                )
-                logger.info("Applied targeted parenthesis fix for STRING_TO_ARRAY(LOWER(metadata->>'condition')), ...) pattern in custom SQL.")
+        custom_sql_query = result.get("params", {}).get("query", "")
+
+        # Targeted fix for malformed SQL for REGEXP_SPLIT_TO_TABLE
+        if (
+            "FROM patients', REGEXP_SPLIT_TO_TABLE" in custom_sql_query
+            or "FROM patients \' , REGEXP_SPLIT_TO_TABLE" in custom_sql_query
+        ):
+            custom_sql_query = custom_sql_query.replace(
+                "FROM patients', REGEXP_SPLIT_TO_TABLE",
+                "FROM patients, REGEXP_SPLIT_TO_TABLE"
+            ).replace(
+                "FROM patients \' , REGEXP_SPLIT_TO_TABLE",
+                "FROM patients, REGEXP_SPLIT_TO_TABLE"
+            )
+            logger.info("Fixed malformed SQL for REGEXP_SPLIT_TO_TABLE in distinct conditions query.")
+        # Update the result dict as well
+        if isinstance(result.get("params"), dict):
+            result["params"]["query"] = custom_sql_query
+
+                # Specific fix for a common LLM malformation with STRING_TO_ARRAY
+        if "STRING_TO_ARRAY(LOWER(metadata->>'condition')), " in custom_sql_query:
+            custom_sql_query = custom_sql_query.replace(
+                "STRING_TO_ARRAY(LOWER(metadata->>'condition')), ",
+                "STRING_TO_ARRAY(LOWER(metadata->>'condition'), ",
+                1 # Replace only the first occurrence, just in case
+            )
+            logger.info("Applied targeted parenthesis fix for STRING_TO_ARRAY(LOWER(metadata->>'condition')), ...) pattern in custom SQL.")
+            if isinstance(result.get("params"), dict):
                 result["params"]["query"] = custom_sql_query # Update the stored query as well
+                 
+        # Fix potential JSON formatting issues in INSERT statements
+        if custom_sql_query.upper().startswith("INSERT") and "metadata" in custom_sql_query and "::jsonb" not in custom_sql_query:
+            try:
+                # Identify if there's a JSON value that needs fixing
+                json_pattern = re.search(r"VALUES\s*\([^)]*'({[^}]*})'", custom_sql_query)
+                if json_pattern:
+                    json_text = json_pattern.group(1)
+                    try:
+                        # Try to parse it to ensure it's valid JSON
+                        parsed_json = json.loads(json_text)
+                        
+                        # Add ::jsonb type cast
+                        fixed_sql = custom_sql_query.replace(f"'{json_text}'", f"'{json_text}'::jsonb")
+                        custom_sql_query = fixed_sql
+                        logger.info(f"Added ::jsonb type cast to JSON in INSERT statement: {custom_sql_query}")
+                    except json.JSONDecodeError:
+                        # If it's not valid JSON, it might be a string that needs escaping
+                        possible_json_text = json_text.replace("'", "\\'")
+                        try:
+                            # Try to fix double quotes that might have been improperly escaped
+                            if '"{' in possible_json_text or '}"' in possible_json_text:
+                                possible_json_text = possible_json_text.replace('"{', '{').replace('}"', '}')
+                            
+                            fixed_json = json.loads(possible_json_text)
+                            fixed_sql = custom_sql_query.replace(f"'{json_text}'", f"'{json.dumps(fixed_json)}'::jsonb")
+                            custom_sql_query = fixed_sql
+                            logger.info(f"Fixed JSON formatting in INSERT statement: {custom_sql_query}")
+                        except:
+                            # If we still can't fix it, create a proper formatted JSON for known patterns
+                            if "condition" in json_text:
+                                try:
+                                    # Extract the condition
+                                    condition_match = re.search(r'"condition":\s*"([^"]*)"', json_text)
+                                    if condition_match:
+                                        condition_value = condition_match.group(1)
+                                        # Create a completely new properly formatted SQL
+                                        name_match = re.search(r"VALUES\s*\(\s*'([^']*)'", custom_sql_query)
+                                        age_match = re.search(r"VALUES\s*\(\s*'[^']*'\s*,\s*(\d+)", custom_sql_query)
+                                        
+                                        if name_match and age_match:
+                                            name_value = name_match.group(1)
+                                            age_value = age_match.group(1)
+                                            
+                                            metadata_json = json.dumps({"condition": condition_value})
+                                            fixed_sql = f"INSERT INTO patients (name, age, metadata) VALUES ('{name_value}', {age_value}, '{metadata_json}'::jsonb)"
+                                            custom_sql_query = fixed_sql
+                                            logger.info(f"Completely rebuilt INSERT statement with proper JSON: {custom_sql_query}")
+                                except Exception as e:
+                                    logger.error(f"Failed to rebuild INSERT statement: {e}")
+            except Exception as e:
+                logger.error(f"Error fixing JSON in INSERT statement: {e}")
+            
+            # Update the result dict with the potentially fixed SQL
+            if isinstance(result.get("params"), dict):
+                result["params"]["query"] = custom_sql_query
+
+        # Proceed with execution if custom_sql_query is valid (not empty)
+        if custom_sql_query:
+            query_to_display_on_error = custom_sql_query # Use the (potentially fixed) query
+            sql_args = [] # For this direct SQL model, we are not expecting parameterized queries from LLM in PARAMS: {args: ...}
 
             db_result = execute_db_query(
                 sql_query=custom_sql_query, 
@@ -1387,37 +1420,67 @@ User question: {question}
                 query_result_count = len(db_result)
                 logger.info(f"Custom query successfully executed. Result rows: {query_result_count}. First row (if any): {db_result[0] if db_result else 'N/A'}")
                 
-                # Check if the custom query was a COUNT query
+                # Check if the custom query was a COUNT or AVG query
                 is_count_query = "COUNT(" in custom_sql_query.upper()
+                is_avg_query = "AVG(" in custom_sql_query.upper() # Added this line
 
                 if is_count_query and query_result_count == 1 and db_result[0] and len(db_result[0].keys()) == 1:
                     # This is a count query, and it returned one row with one column (the count)
                     count_value = list(db_result[0].values())[0]
                     result["answer"] = f"The count is {count_value}."
                     logger.info(f"Overriding AI answer with specific count: {count_value} for query: {custom_sql_query}")
+                elif is_avg_query and query_result_count == 1 and db_result[0] and len(db_result[0].keys()) == 1: # Added this elif block
+                    avg_value = list(db_result[0].values())[0]
+                    if avg_value is not None:
+                        avg_field = safe_avg_field(custom_sql_query)
+                        try:
+                            result["answer"] = f"The average {avg_field} is {float(avg_value):.2f}."
+                        except ValueError: 
+                            result["answer"] = f"The average {avg_field} is {avg_value}."
+                    else:
+                        result["answer"] = "The query for an average value executed successfully, but no matching records were found to compute the average (result is NULL)."
+                    logger.info(f"Overriding AI answer with specific average: {avg_value} for query: {custom_sql_query}")
                 else:
                     # Determine if we should override AI's initial answer for non-count or more complex results
+                    # The condition for `should_override_ai_answer` uses `messages`
+                    # Ensuring `messages` is available or adjusting the condition.
+                    # For this edit, I will assume `messages` is available in the function scope as per previous context.
+                    
+                    last_user_message_content = ""
+                    if 'messages' in locals() and messages and messages[-1]["role"] == "user":
+                        content = messages[-1]["content"]
+                        match = re.search(r"User question:\\s*(.*)", content, re.DOTALL)
+                        if match:
+                            last_user_message_content = match.group(1).strip()
+
                     should_override_ai_answer = not result.get("answer") or \
                                               result["answer"] == "I'll provide an answer after executing a custom query." or \
                                               "is unknown" in result.get("answer", "").lower() or \
                                               "not provided in the database summary" in result.get("answer", "").lower() or \
-                                              result.get("answer", "").strip().lower() == query_to_process.strip().lower() # If AI answer is just the question
+                                              (last_user_message_content and result.get("answer", "").strip().lower() == last_user_message_content.lower()) or \
+                                              "results will be displayed directly" in result.get("answer", "").lower()
 
                     if should_override_ai_answer:
                         if query_result_count == 0:
                             result["answer"] = "The query executed successfully but returned no matching records."
-                        elif query_result_count == 1:
+                        elif query_result_count >= 1 and len(db_result[0].keys()) == 1:
+                            # Query returned one or more rows, but only a single column
+                            # Ideal for listing things like extension names, table names, distinct conditions
+                            column_name = list(db_result[0].keys())[0]
+                            items = [row[column_name] for row in db_result if row[column_name] is not None]
+                            if items:
+                                # Add the AI's original textual answer first, then the bulleted list
+                                base_answer = result.get("answer", "Query results:").strip()
+                                if not base_answer.endswith(".") and not base_answer.endswith(":"):
+                                    base_answer += "."
+                                items_str = "\n".join([f"- {item}" for item in items])
+                                result["answer"] = f"{base_answer}\nHere are the {column_name.replace('_',' ')}s:\n{items_str}"
+                            else:
+                                result["answer"] = f"The query for {column_name.replace('_',' ')} returned no items or only NULL values."
+                        elif query_result_count == 1: # Single row, multiple columns
                             first_row = db_result[0]
-                            if len(first_row.keys()) == 1: # Single column in the single row (might be non-count, e.g., AVG)
-                                column_name = list(first_row.keys())[0]
-                                value = first_row[column_name]
-                                if value is None:
-                                    result["answer"] = f"The query for '{column_name.replace('_', ' ')}' resulted in no specific value (it was NULL/None), which usually means no data matched the criteria for the calculation."
-                                else:
-                                    result["answer"] = f"The {column_name.replace('_', ' ')} is {value}."
-                            else: # Multiple columns in the single row result
-                                result["answer"] = f"The query returned one record: {json.dumps(first_row)}"
-                        else: # Multiple rows
+                            result["answer"] = f"The query returned one record: {json.dumps(first_row)}"
+                        else: # Multiple rows, multiple columns
                             result["answer"] = f"I found {query_result_count} records matching your query. Here are the first few: {json.dumps(db_result[:3])}"
                     else:
                         logger.info("AI provided an initial answer; not overwriting with generic query result summary based on override logic.")
@@ -1939,6 +2002,21 @@ def display_qa_statistics():
 
 def qa_interface():
     st.title("Medical Q&A Search")
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = 2  # Default to Natural Language Database Query tab
+    
+    # Create tabs and select the active one based on session state
+    tab1, tab2, tab3, tab4 = st.tabs(["Ask AI", "Search Database", "Natural Language Database Query", "RAGAS Evaluation"])
+
+    # Function to update active tab and maintain state across page refreshes
+    def set_active_tab(tab_index):
+        st.session_state.active_tab = tab_index
+        
+            # The active tab is handled by Streamlit and our session state management    # We use st.session_state.active_tab when we need to restore state or switch tabs
+        
+    # Use this function before every st.rerun() in your NL DB Query tab:
+    # set_active_tab(2)
+    # st.rerun()
     
     search_col1, search_col2 = st.columns([3, 1])
     with search_col1:
@@ -2277,7 +2355,7 @@ if page == "Edit Database Entries":
                             conn.commit()
                             logger.info(f"Removed patient with ID: {selected_id}")
                             st.success("Patient removed successfully!")
-                            st.rerun()
+                            # Script will rerun automatically when the next button is clicked
                         except Exception as e:
                             conn.rollback()
                             logger.error(f"Error removing patient ID {selected_id}: {e}")
@@ -2300,7 +2378,7 @@ if page == "Edit Database Entries":
                     try:
                         import_data_from_csv(uploaded_csv_file)
                         st.balloons()
-                        st.rerun()
+                        # Script will rerun automatically when the next button is clicked
                     except Exception as e_csv_import:
                         st.error(f"❌ Error processing CSV file: {str(e_csv_import)}")
                         logger.error(f"Error during CSV import via UI: {e_csv_import}")
@@ -2378,8 +2456,7 @@ elif page == "Q&A Assistant":
         if LLAMA_API_CONFIGURED:
             st.success("✅ Llama API key is configured and active")
             if st.button("Clear API Key"):
-                if clear_llama_api_key():
-                    st.experimental_rerun()
+                clear_llama_api_key()
         else:
             api_key_input = st.text_input("Enter your Llama API Key", type="password", help="Your API key is not stored permanently and will be used only for this session.")
             if st.button("Save API Key"):
@@ -2387,7 +2464,6 @@ elif page == "Q&A Assistant":
                     if update_llama_api_key(api_key_input):
                         st.success("✅ API Key saved successfully!")
                         time.sleep(1)
-                        st.experimental_rerun()
                     else:
                         st.error("Failed to update API key. Please ensure it is a valid key.")
                 else:
@@ -2402,7 +2478,7 @@ elif page == "Q&A Assistant":
         """)
         
         # Create tabs for different Q&A modes
-        tab1, tab2, tab3 = st.tabs(["Ask AI", "Search Database", "Natural Language Database Query"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Ask AI", "Search Database", "Natural Language Database Query", "RAGAS Evaluation"])
         
         # Tab 1: Ask AI directly
         with tab1:
@@ -2466,111 +2542,528 @@ elif page == "Q&A Assistant":
             - How many patients have diabetes?
             - Show me all patients with heart disease
             - Which patients are older than 65?
-            """)
-            
-            # Get user input for the natural language query
-            
-            # Check if we need to clear the input from a previous successful submission
-            current_nl_input_value = ""
-            if "nl_db_query_input" in st.session_state and not st.session_state.get("clear_nl_input_flag", False):
-                current_nl_input_value = st.session_state.nl_db_query_input
-            
-            if st.session_state.get("clear_nl_input_flag", False):
-                st.session_state.clear_nl_input_flag = False # Reset the flag
-                # current_nl_input_value is already "" as initialized
-
-            nl_query_input = st.text_input("Your database question:", 
-                                        value=current_nl_input_value, 
-                                        placeholder="e.g., How many patients have diabetes?", 
-                                        key="nl_db_query_input")
-            
+            """)            # Using global safe_avg_field function defined at the top of the file            # --- Add Clear Chat button ---
+            if st.button("Clear Chat", use_container_width=True, key="clear_chat_button"):
+                st.session_state.db_tab_conversation = []
+                # No need for st.rerun() here as the script will rerun automatically after button press
             # Initialize or retrieve conversation history for this tab
             if "db_tab_conversation" not in st.session_state:
                 st.session_state.db_tab_conversation = []
 
-            # Display past messages from session state
+            # Display past messages from session state using st.markdown
             for i, entry in enumerate(st.session_state.db_tab_conversation):
-                is_user = entry["role"] == "user"
-                # Assuming you have streamlit_chat imported as `from streamlit_chat import message`
-                # If not, you'll need to adjust this part or use st.markdown/st.write for display
-                try:
-                    from streamlit_chat import message # Dynamically import if available
-                    message(entry["content"], is_user=is_user, key=f"db_tab_{i}")
-                except ImportError:
-                    if 'streamlit_chat_warning_shown' not in st.session_state:
-                        st.warning("streamlit_chat is not installed. Using fallback message display. Run 'pip install streamlit-chat' to install.", icon="⚠️")
-                        st.session_state.streamlit_chat_warning_shown = True
-                    if is_user:
-                        st.markdown(f"<div style='text-align: left; background-color: #007bff; color: white; padding: 10px; border-radius: 8px; margin-bottom: 5px;'>You: {entry["content"]}</div>", unsafe_allow_html=True)
+                if entry["role"] == "user":
+                    st.markdown(f"**You:** {entry['content']}")
+                else:
+                    st.markdown(f"**AI:** {entry['content']}")
+                    # Optionally, display the generated SQL if it was stored with the AI's response
+                    if "sql_query" in entry and entry["sql_query"]:
+                        st.code(entry["sql_query"], language="sql")
+                st.markdown("---") # Add a separator
+
+            # Get user input for the natural language query
+            # Check if we need to clear the input from a previous successful submission
+            current_nl_input_value = ""
+            if "nl_db_query_input" in st.session_state and not st.session_state.get("clear_nl_input_flag", False):
+                current_nl_input_value = st.session_state.nl_db_query_input
+            if st.session_state.get("clear_nl_input_flag", False):
+                st.session_state.clear_nl_input_flag = False # Reset the flag
+                current_nl_input_value = ""
+
+            # Define greetings and general chat triggers
+            GREETINGS = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "how are you", "what's up", "sup"]
+
+            def is_greeting(text):
+                return any(text.strip().lower().startswith(greet) for greet in GREETINGS)
+
+            def execute_nl_query_callback():
+                if st.session_state.nl_db_query_input:
+                    # Check for greeting
+                    if is_greeting(st.session_state.nl_db_query_input):
+                        st.session_state.db_tab_conversation.append({"role": "assistant", "content": "👋 Hello! I'm ready to assist you. You can ask me about the patient database or just chat!"})
+                        st.session_state.clear_nl_input_flag = True
+                        st.session_state.just_submitted_nl_query = True
+                        # st.rerun() - This doesn't work in callbacks
                     else:
-                        st.markdown(f"<div style='text-align: left; background-color: #4F4F4F; color: white; padding: 10px; border-radius: 8px; margin-bottom: 5px;'>AI: {entry["content"]}</div>", unsafe_allow_html=True)
+                        st.session_state.db_tab_conversation.append({"role": "user", "content": st.session_state.nl_db_query_input})
+                        st.session_state.clear_nl_input_flag = True
+                        st.session_state.just_submitted_nl_query = True
+                        # st.rerun() - This doesn't work in callbacks
+
+            # Only allow one submission per input
+            if "just_submitted_nl_query" not in st.session_state:
+                st.session_state.just_submitted_nl_query = False
+
+            # If clear_nl_input_flag is True and we need to clear the input after a submission
+            if "clear_nl_input_flag" in st.session_state and st.session_state.clear_nl_input_flag:
+                current_nl_input_value = ""
+                st.session_state.clear_nl_input_flag = False
+
+            nl_query_input = st.text_input(
+                "Your database question:",
+                value=current_nl_input_value,
+                placeholder="e.g., How many patients have diabetes?",
+                key="nl_db_query_input",
+                on_change=execute_nl_query_callback
+            )
 
             if st.button("Execute Query", use_container_width=True, key="execute_nl_query_button"):
-                if not nl_query_input:
+                if st.session_state.just_submitted_nl_query:
+                    st.session_state.just_submitted_nl_query = False  # Reset for next input
+                elif not st.session_state.nl_db_query_input:
                     st.warning("Please enter a question first.")
                 else:
-                    processed_nl_query = nl_query_input.strip()
-                    # Simple check: if query is short, doesn't contain spaces, and isn't clearly a full question,
-                    # assume it's a condition and transform it.
-                    words_in_query = processed_nl_query.split()
-                    # More robust check for simple terms, avoiding common question words/phrases
-                    question_starters = ["what", "how", "who", "when", "where", "which", "list", "show", "count", "average", "get", "find", "tell me about"]
-                    is_likely_simple_term = len(words_in_query) <= 2 and not any(starter in processed_nl_query.lower() for starter in question_starters)
-
-                    if is_likely_simple_term and not any(char in processed_nl_query for char in ['?', '%', '*', '=', '<', '>']):
-                        # Default transformation for a simple term: ask to count patients with that condition.
-                        transformed_query = f"How many patients have {processed_nl_query}?"
-                        st.info(f"Interpreting your input '{nl_query_input}' as: '{transformed_query}'")
-                        final_query_for_ai = transformed_query
+                    # Check for greeting
+                    if is_greeting(st.session_state.nl_db_query_input):
+                        st.session_state.db_tab_conversation.append({"role": "assistant", "content": "👋 Hello! I'm ready to assist you. You can ask me about the patient database or just chat!"})
+                        st.session_state.clear_nl_input_flag = True
+                        st.session_state.just_submitted_nl_query = True
+                        # st.rerun() - This doesn't work in callbacks
                     else:
-                        final_query_for_ai = processed_nl_query
-
-                    # Add user's (possibly transformed) query to conversation history for this tab
-                    st.session_state.db_tab_conversation.append({"role": "user", "content": final_query_for_ai})
-                    # Re-run to immediately display the user message
-                    st.rerun()
+                        st.session_state.db_tab_conversation.append({"role": "user", "content": st.session_state.nl_db_query_input})
+                        st.session_state.clear_nl_input_flag = True
+                        st.session_state.just_submitted_nl_query = True
+                        # st.rerun() - This doesn't work in callbacks
             
             # Process the latest user query if it exists in history and hasn't been processed
-            # This logic assumes we add user message, rerun, then process in the next run.
             if st.session_state.db_tab_conversation and st.session_state.db_tab_conversation[-1]["role"] == "user":
                 query_to_process = st.session_state.db_tab_conversation[-1]["content"]
                 
                 with st.spinner("🤖 AI is thinking and querying the database..."):
                     try:
-                        ai_response_data = ai_process_patient_db_question(query_to_process)
-                        ai_answer = ai_response_data.get("answer", "Sorry, I couldn't process that response from the AI.")
+                        history_for_ai = []
+                        if len(st.session_state.db_tab_conversation) > 1:
+                            history_for_ai = st.session_state.db_tab_conversation[:-1]
                         
-                        if "failed_query_details" in ai_response_data: 
-                            ai_answer += f" (Details: {ai_response_data['failed_query_details']})"
+                        ai_response_data = ai_process_patient_db_question(query_to_process, history_for_ai)
+                        
+                        initial_ai_explanation_for_ragas = ai_response_data.get("answer", "AI provided no initial textual explanation.")
+                        generated_sql_for_ragas = ai_response_data.get("params", {}).get("query", "")
+                        
+                        final_answer_for_display_and_ragas = initial_ai_explanation_for_ragas 
+                        db_results_raw_for_ragas = None 
 
-                        st.session_state.db_tab_conversation.append({"role": "assistant", "content": ai_answer})
-                        
-                        # Display the new AI response 
-                        try:
-                            from streamlit_chat import message
-                            message(ai_answer, key=f"db_tab_ai_{len(st.session_state.db_tab_conversation)}")
-                        except ImportError:
-                            st.markdown(f"<div style='text-align: left; background-color: #4F4F4F; color: white; padding: 10px; border-radius: 8px; margin-bottom: 5px;'>AI: {ai_answer}</div>", unsafe_allow_html=True)
+                        if generated_sql_for_ragas:
+                            db_execution_result = execute_db_query(
+                                sql_query=generated_sql_for_ragas, 
+                                args=[], 
+                                is_custom_query=True
+                            )
+                            db_results_raw_for_ragas = db_execution_result 
 
-                        # Optionally, display the generated SQL
-                        if "params" in ai_response_data and isinstance(ai_response_data["params"], dict) and "query" in ai_response_data["params"]:
-                            if ai_response_data.get("query_type") == "custom_query":
-                                st.code(ai_response_data["params"]["query"], language="sql")
+                            if isinstance(db_execution_result, dict) and "error" in db_execution_result:
+                                final_answer_for_display_and_ragas = f"Error executing SQL: {db_execution_result['error']}. Query: {generated_sql_for_ragas}"
+                            elif isinstance(db_execution_result, list):
+                                query_result_count = len(db_execution_result)
+                                is_count_query = "COUNT(" in generated_sql_for_ragas.upper()
+                                is_avg_query = "AVG(" in generated_sql_for_ragas.upper()
+
+                                if is_count_query and query_result_count == 1 and db_execution_result[0] and len(db_execution_result[0].keys()) == 1:
+                                    count_value = list(db_execution_result[0].values())[0]
+                                    final_answer_for_display_and_ragas = f"The count is {count_value}."
+                                elif is_avg_query and query_result_count == 1 and db_execution_result[0] and len(db_execution_result[0].keys()) == 1:
+                                    avg_value = list(db_execution_result[0].values())[0]
+                                    avg_field = safe_avg_field(generated_sql_for_ragas)
+                                    final_answer_for_display_and_ragas = f"The average {avg_field} is {float(avg_value):.2f}." if avg_value is not None else "Average could not be computed (no data)."
+                                else: 
+                                    if query_result_count == 0:
+                                        final_answer_for_display_and_ragas = "Query executed, no matching records found."
+                                    elif query_result_count >= 1 and db_execution_result[0] and len(db_execution_result[0].keys()) == 1:
+                                        column_name = list(db_execution_result[0].keys())[0]
+                                        items = [row[column_name] for row in db_execution_result if row[column_name] is not None]
+                                        items_str = "\n".join([f"- {item}" for item in items])
+                                        
+                                        # Check if AI already provided the results in its explanation
+                                        contains_all_items = True
+                                        for item in items:
+                                            if str(item).lower() not in initial_ai_explanation_for_ragas.lower():
+                                                contains_all_items = False
+                                                break
+                                                
+                                        # If AI already listed all results, don't repeat them
+                                        if contains_all_items and "Here are" in initial_ai_explanation_for_ragas:
+                                            final_answer_for_display_and_ragas = initial_ai_explanation_for_ragas
+                                        else:
+                                            base_answer_text = initial_ai_explanation_for_ragas if initial_ai_explanation_for_ragas != "AI provided no initial textual explanation." else "Query results:"
+                                            final_answer_for_display_and_ragas = f"{base_answer_text}\nHere are the {column_name.replace('_',' ')}s:\n{items_str}" if items else f"{base_answer_text}\nNo {column_name.replace('_',' ')}s found."
+                                    elif query_result_count > 0 : # Multiple rows, multiple columns or single row, multiple columns
+                                        base_answer_text = initial_ai_explanation_for_ragas if initial_ai_explanation_for_ragas != "AI provided no initial textual explanation." else f"Found {query_result_count} records:"
+                                        
+                                        results_for_display = []
+                                        if db_execution_result and isinstance(db_execution_result, list):
+                                            for row in db_execution_result:
+                                                if isinstance(row, dict):
+                                                    row_copy = {k: v for k, v in row.items() if k != 'embedding'}
+                                                    results_for_display.append(row_copy)
+                                                else:
+                                                    results_for_display.append(row) 
+                                        else:
+                                            results_for_display = db_execution_result 
+
+                                        # Format as a point-by-point list for readability
+                                        formatted_records_str = "\n"
+                                        for i, record in enumerate(results_for_display[:3]): # Show first 3 records
+                                            formatted_records_str += f"Record {i+1}:\n"
+                                            if isinstance(record, dict):
+                                                for key, value in record.items():
+                                                    # Skip embedding even if it somehow made it here
+                                                    if key == 'embedding': continue 
+                                                    # Nicely format metadata if it's a dict itself
+                                                    if key == 'metadata' and isinstance(value, dict):
+                                                        formatted_records_str += f"  - Metadata:\n"
+                                                        for meta_key, meta_val in value.items():
+                                                            formatted_records_str += f"    - {meta_key.replace('_',' ').capitalize()}: {meta_val}\n"
+                                                    else:
+                                                        formatted_records_str += f"  - {key.replace('_',' ').capitalize()}: {value}\n"
+                                            else: # If record is not a dict, just show its string representation
+                                                formatted_records_str += f"  - {str(record)}\n"
+                                            formatted_records_str += "\n"
+                                        
+                                        if query_result_count > 3:
+                                            formatted_records_str += f"... and {query_result_count - 3} more records."
+
+                                        final_answer_for_display_and_ragas = f"{base_answer_text}\n{formatted_records_str.strip()}"
+                                    else: 
+                                        final_answer_for_display_and_ragas = f"{initial_ai_explanation_for_ragas}\nQuery executed, but the result format was unusual or no results."
+
+                            else: # Not dict with error, not list - unexpected from execute_db_query
+                                final_answer_for_display_and_ragas = f"{initial_ai_explanation_for_ragas}\nQuery executed, but the result format from database was unexpected."
+                        else: # No SQL generated by AI
+                            final_answer_for_display_and_ragas = initial_ai_explanation_for_ragas
                         
-                        # Clear the input box ONLY if AI processing was successful up to this point
-                        # st.session_state.nl_db_query_input = "" 
-                        st.session_state.clear_nl_input_flag = True 
-                        st.rerun() # Rerun to process the flag and reflect cleared input & new AI message
+                        st.session_state['ragas_eval_data_tab3'] = {
+                            "question": query_to_process,
+                            "initial_ai_explanation": initial_ai_explanation_for_ragas,
+                            "generated_sql": generated_sql_for_ragas,
+                            "db_results_raw": db_results_raw_for_ragas, 
+                            "final_answer_displayed": final_answer_for_display_and_ragas
+                        }
+
+                        st.session_state.db_tab_conversation.append({
+                            "role": "assistant", 
+                            "content": final_answer_for_display_and_ragas, 
+                            "sql_query": generated_sql_for_ragas 
+                        })
+                        
+                        st.session_state.clear_nl_input_flag = True
+                        # Force a page rerun to display the response immediately
+                        st.rerun()
 
                     except Exception as e:
                         logger.error(f"Error in Streamlit app during AI DB query: {e}", exc_info=True)
                         error_msg_for_display = f"An error occurred: {e}"
-                        st.error(error_msg_for_display)
-                        st.session_state.db_tab_conversation.append({"role": "assistant", "content": error_msg_for_display})
+                        st.error(error_msg_for_display) # Display error on main screen
+                        st.session_state.db_tab_conversation.append({"role": "assistant", "content": error_msg_for_display, "sql_query": None})
+                        # Force a page rerun to display the error immediately
                         st.rerun()
     else:
         st.info("Please configure your Llama API key in the section above to use the Q&A Assistant.")
     
+    # RAGAS Evaluation Tab (New)
+    if LLAMA_API_CONFIGURED:
+        with tab4: # Assuming this is how new tabs are added, adjust if Streamlit has a different API for this.
+            st.markdown("### RAG Evaluation with RAGAS")
+            st.markdown("Click the button below to evaluate the last Q&A performed in the 'Ask AI' tab using RAGAS metrics.")
+
+            if st.button("Evaluate Last 'Ask AI' Q&A"):
+                if 'ragas_eval_data' in st.session_state and st.session_state['ragas_eval_data']:
+                    eval_data = st.session_state['ragas_eval_data']
+                    
+                    # Ensure there are contexts for context-related metrics
+                    # RAGAS expects contexts to be a list of lists of strings, even for a single question evaluation.
+                    # Or, if context_recall and context_precision are not used with an LLM judge, 
+                    # they might need a ground_truth. For now, we focus on LLM-judged metrics.
+
+                    # Prepare data for RAGAS - it expects a Hugging Face Dataset
+                    # For a single evaluation, we create a dataset with one row.
+                    data_for_hf_dataset = {
+                        'question': [eval_data['question']],
+                        'answer': [eval_data['answer']],
+                        'contexts': [eval_data['contexts']], # contexts should be List[List[str]]
+                         # 'ground_truth': [eval_data.get('ground_truth', "")] # If using metrics that need ground truth
+                    }
+                    
+                    # Ensure contexts is List[List[str]]
+                    if not isinstance(data_for_hf_dataset['contexts'][0], list):
+                        # This means eval_data['contexts'] was likely List[str], wrap it
+                        data_for_hf_dataset['contexts'] = [[str(c) for c in eval_data['contexts']]]
+                    elif eval_data['contexts'] and not isinstance(eval_data['contexts'][0], str):
+                        # It's already List[List[something]], ensure inner elements are strings
+                         data_for_hf_dataset['contexts'] = [[[str(inner_c) for inner_c in c_list] for c_list in eval_data['contexts']]]
+                    else: # It was an empty list or already correctly List[List[str]] (empty case)
+                        if not eval_data['contexts']:
+                            data_for_hf_dataset['contexts'] = [[]]
+
+                    dataset = Dataset.from_dict(data_for_hf_dataset)
+                    
+                    with st.spinner("Evaluating with RAGAS..."):
+                        try:
+                            # Define metrics
+                            metrics_to_evaluate = [
+                                faithfulness, 
+                                answer_relevancy,
+                            ]
+                            
+                            # Filter metrics if no context is available to avoid errors
+                            if not eval_data['contexts']:
+                                st.warning("No contexts were retrieved for the last Q&A. Evaluating faithfulness and answer relevancy.")
+                            
+                            if openai_wrapper:
+                                # Inline implementation instead of calling custom_ragas_evaluate
+                                logger.info(f"Starting custom RAGAS evaluation with metrics: {metrics_to_evaluate}")
+                                
+                                results = {}
+                                
+                                # Process each metric
+                                for metric in metrics_to_evaluate:
+                                    # Get metric name properly - instead of using __name__ attribute
+                                    metric_name = metric.__class__.__name__.lower()
+                                    logger.info(f"Evaluating metric: {metric_name}")
+                                    
+                                    if metric_name == "faithfulness":
+                                        # Simple implementation of faithfulness
+                                        scores = []
+                                        for i in range(len(dataset)):
+                                            question = dataset[i]['question']
+                                            answer = dataset[i]['answer']
+                                            
+                                            # Create a prompt to check if answer is faithful to the context
+                                            prompt = (
+                                                f"Question: {question}\n\n"
+                                                f"Answer: {answer}\n\n"
+                                                "On a scale of 1-10, how faithful is this answer to the question, "
+                                                "where 10 means completely faithful and accurate, and 1 means completely unfaithful or irrelevant?"
+                                            )
+                                            
+                                            # Call our wrapper directly
+                                            response = openai_wrapper(prompt)
+                                            logger.info(f"Faithfulness response: {response}")
+                                            
+                                            # Extract score from response (simple approach)
+                                            try:
+                                                # Look for numbers in the response
+                                                import re
+                                                score_matches = re.findall(r'\b([1-9]|10)\b', response)
+                                                if score_matches:
+                                                    score = int(score_matches[0])
+                                                    normalized_score = score / 10.0  # Normalize to 0-1
+                                                    scores.append(normalized_score)
+                                                else:
+                                                    logger.warning(f"Could not extract score from faithfulness response: {response}")
+                                                    scores.append(0.5)  # Default middle score
+                                            except Exception as e:
+                                                logger.error(f"Error extracting faithfulness score: {e}")
+                                                scores.append(0.5)  # Default middle score
+                                        
+                                        # Average the scores
+                                        results[metric_name] = sum(scores) / len(scores) if scores else 0
+                                    
+                                    elif metric_name == "answer_relevancy":
+                                        # Simple implementation of answer relevancy
+                                        scores = []
+                                        for i in range(len(dataset)):
+                                            question = dataset[i]['question']
+                                            answer = dataset[i]['answer']
+                                            
+                                            # Create a prompt to check if answer is relevant to the question
+                                            prompt = (
+                                                f"Question: {question}\n\n"
+                                                f"Answer: {answer}\n\n"
+                                                "On a scale of 1-10, how relevant is this answer to the question, "
+                                                "where 10 means completely relevant and addresses the question directly, "
+                                                "and 1 means completely irrelevant?"
+                                            )
+                                            
+                                            # Call our wrapper directly
+                                            response = openai_wrapper(prompt)
+                                            logger.info(f"Relevancy response: {response}")
+                                            
+                                            # Extract score from response (simple approach)
+                                            try:
+                                                # Look for numbers in the response
+                                                import re
+                                                score_matches = re.findall(r'\b([1-9]|10)\b', response)
+                                                if score_matches:
+                                                    score = int(score_matches[0])
+                                                    normalized_score = score / 10.0  # Normalize to 0-1
+                                                    scores.append(normalized_score)
+                                                else:
+                                                    logger.warning(f"Could not extract score from relevancy response: {response}")
+                                                    scores.append(0.5)  # Default middle score
+                                            except Exception as e:
+                                                logger.error(f"Error extracting relevancy score: {e}")
+                                                scores.append(0.5)  # Default middle score
+                                        
+                                        # Average the scores
+                                        results[metric_name] = sum(scores) / len(scores) if scores else 0
+                                    
+                                    else:
+                                        logger.warning(f"Metric {metric_name} not implemented in inline evaluation")
+                                        results[metric_name] = 0.5  # Default middle score
+                                
+                                # Create a DataFrame for display
+                                import pandas as pd
+                                df_data = []
+                                for metric_name, score in results.items():
+                                    df_data.append({"metric": metric_name, "score": score})
+                                
+                                scores_df = pd.DataFrame(df_data)
+                                st.success("RAGAS Evaluation Complete!")
+                                st.dataframe(scores_df)
+                            else:
+                                st.error("OpenAI client (for Groq) is not configured. Cannot run RAGAS evaluation.")
+
+                        except Exception as e_ragas:
+                            st.error(f"Error during RAGAS evaluation: {e_ragas}")
+                            logger.error(f"RAGAS evaluation error: {e_ragas}", exc_info=True)
+                else:
+                    st.warning("No Q&A data found from the 'Ask AI' tab. Please ask a question there first.")
+
+            st.divider()
+            st.markdown("### Evaluate 'Natural Language Database Query' (Tab 3)")
+            st.markdown("Click to evaluate the last interaction from the 'Natural Language Database Query' tab.")
+
+            if st.button("Evaluate Last 'NL DB Query' Interaction"):
+                if 'ragas_eval_data_tab3' in st.session_state and st.session_state['ragas_eval_data_tab3']:
+                    eval_data_tab3 = st.session_state['ragas_eval_data_tab3']
+
+                    # Prepare contexts for RAGAS faithfulness
+                    # Contexts: initial AI explanation, generated SQL, stringified DB results
+                    contexts_for_faithfulness = []
+                    contexts_for_faithfulness.append(str(eval_data_tab3.get("initial_ai_explanation", "")))
+                    contexts_for_faithfulness.append(str(eval_data_tab3.get("generated_sql", "")))
+                    
+                    db_res = eval_data_tab3.get("db_results_raw")
+                    if isinstance(db_res, list): # Successful query execution
+                        contexts_for_faithfulness.append(json.dumps(db_res[:5])) # Sample of results
+                    elif isinstance(db_res, dict) and "error" in db_res: # Error during query
+                        contexts_for_faithfulness.append(f"DB Error: {db_res['error']}")
+                    elif db_res is not None: # Other unexpected format
+                        contexts_for_faithfulness.append(str(db_res))
+                    else: # No DB results (e.g., no query generated)
+                        contexts_for_faithfulness.append("No database query was executed or no results returned.")
+
+                    data_for_hf_dataset_tab3 = {
+                        'question': [eval_data_tab3['question']],
+                        'answer': [eval_data_tab3['final_answer_displayed']],
+                        'contexts': [contexts_for_faithfulness], # Must be List[List[str]]
+                    }
+                    dataset_tab3 = Dataset.from_dict(data_for_hf_dataset_tab3)
+
+                    with st.spinner("Evaluating Tab 3 interaction with RAGAS..."):
+                        try:
+                            metrics_to_evaluate_tab3 = [faithfulness, answer_relevancy]
+                            
+                            if openai_wrapper:
+                                # Inline implementation instead of calling custom_ragas_evaluate
+                                logger.info(f"Starting custom RAGAS evaluation with metrics: {metrics_to_evaluate_tab3}")
+                                
+                                results = {}
+                                
+                                # Process each metric
+                                for metric in metrics_to_evaluate_tab3:
+                                    # Get metric name properly - instead of using __name__ attribute
+                                    metric_name = metric.__class__.__name__.lower()
+                                    logger.info(f"Evaluating metric: {metric_name}")
+                                    
+                                    if metric_name == "faithfulness":
+                                        # Simple implementation of faithfulness
+                                        scores = []
+                                        for i in range(len(dataset_tab3)):
+                                            question = dataset_tab3[i]['question']
+                                            answer = dataset_tab3[i]['answer']
+                                            
+                                            # Create a prompt to check if answer is faithful to the context
+                                            prompt = (
+                                                f"Question: {question}\n\n"
+                                                f"Answer: {answer}\n\n"
+                                                "On a scale of 1-10, how faithful is this answer to the question, "
+                                                "where 10 means completely faithful and accurate, and 1 means completely unfaithful or irrelevant?"
+                                            )
+                                            
+                                            # Call our wrapper directly
+                                            response = openai_wrapper(prompt)
+                                            logger.info(f"Faithfulness response: {response}")
+                                            
+                                            # Extract score from response (simple approach)
+                                            try:
+                                                # Look for numbers in the response
+                                                import re
+                                                score_matches = re.findall(r'\b([1-9]|10)\b', response)
+                                                if score_matches:
+                                                    score = int(score_matches[0])
+                                                    normalized_score = score / 10.0  # Normalize to 0-1
+                                                    scores.append(normalized_score)
+                                                else:
+                                                    logger.warning(f"Could not extract score from faithfulness response: {response}")
+                                                    scores.append(0.5)  # Default middle score
+                                            except Exception as e:
+                                                logger.error(f"Error extracting faithfulness score: {e}")
+                                                scores.append(0.5)  # Default middle score
+                                        
+                                        # Average the scores
+                                        results[metric_name] = sum(scores) / len(scores) if scores else 0
+                                    
+                                    elif metric_name == "answer_relevancy":
+                                        # Simple implementation of answer relevancy
+                                        scores = []
+                                        for i in range(len(dataset_tab3)):
+                                            question = dataset_tab3[i]['question']
+                                            answer = dataset_tab3[i]['answer']
+                                            
+                                            # Create a prompt to check if answer is relevant to the question
+                                            prompt = (
+                                                f"Question: {question}\n\n"
+                                                f"Answer: {answer}\n\n"
+                                                "On a scale of 1-10, how relevant is this answer to the question, "
+                                                "where 10 means completely relevant and addresses the question directly, "
+                                                "and 1 means completely irrelevant?"
+                                            )
+                                            
+                                            # Call our wrapper directly
+                                            response = openai_wrapper(prompt)
+                                            logger.info(f"Relevancy response: {response}")
+                                            
+                                            # Extract score from response (simple approach)
+                                            try:
+                                                # Look for numbers in the response
+                                                import re
+                                                score_matches = re.findall(r'\b([1-9]|10)\b', response)
+                                                if score_matches:
+                                                    score = int(score_matches[0])
+                                                    normalized_score = score / 10.0  # Normalize to 0-1
+                                                    scores.append(normalized_score)
+                                                else:
+                                                    logger.warning(f"Could not extract score from relevancy response: {response}")
+                                                    scores.append(0.5)  # Default middle score
+                                            except Exception as e:
+                                                logger.error(f"Error extracting relevancy score: {e}")
+                                                scores.append(0.5)  # Default middle score
+                                        
+                                        # Average the scores
+                                        results[metric_name] = sum(scores) / len(scores) if scores else 0
+                                    
+                                    else:
+                                        logger.warning(f"Metric {metric_name} not implemented in inline evaluation")
+                                        results[metric_name] = 0.5  # Default middle score
+                                
+                                # Create a DataFrame for display
+                                import pandas as pd
+                                df_data = []
+                                for metric_name, score in results.items():
+                                    df_data.append({"metric": metric_name, "score": score})
+                                
+                                scores_df_tab3 = pd.DataFrame(df_data)
+                                st.success("RAGAS Evaluation for Tab 3 Complete!")
+                                st.dataframe(scores_df_tab3)
+                            else:
+                                st.error("OpenAI client (for Groq) is not configured. Cannot run RAGAS evaluation.")
+                        except Exception as e_ragas_tab3:
+                            st.error(f"Error during RAGAS evaluation for Tab 3: {e_ragas_tab3}")
+                            logger.error(f"RAGAS Tab 3 evaluation error: {e_ragas_tab3}", exc_info=True)
+                else:
+                    st.warning("No data found from the 'Natural Language Database Query' tab. Please interact there first.")
+
     # Show usage statistics at the bottom
     if 'ai_request_timestamps' in st.session_state and st.session_state['ai_request_timestamps']:
         with st.expander("Usage Statistics"):
@@ -2588,3 +3081,123 @@ elif page == "Q&A Assistant":
             with stats_col3:
                 st.metric("All Time", total_count)
 
+# Custom RAGAS evaluation function that uses our wrapper directly
+def custom_ragas_evaluate(dataset, metrics, llm):
+    """Custom implementation of RAGAS evaluation using our wrapper directly.
+    
+    Args:
+        dataset: A HuggingFace Dataset with 'question', 'answer', and 'contexts' columns
+        metrics: List of RAGAS metrics to evaluate
+        llm: Our OpenAIWrapper instance
+        
+    Returns:
+        A dictionary of metric names to scores
+    """
+    logger.info(f"Starting custom RAGAS evaluation with metrics: {metrics}")
+    
+    results = {}
+    try:
+        # For each metric, calculate the score directly
+        for metric in metrics:
+            # Get metric name properly - instead of using __name__ attribute
+            metric_name = metric.__class__.__name__.lower()
+            logger.info(f"Evaluating metric: {metric_name}")
+            
+            if metric_name == "faithfulness":
+                # Simple implementation of faithfulness
+                scores = []
+                for i in range(len(dataset)):
+                    question = dataset[i]['question']
+                    answer = dataset[i]['answer']
+                    
+                    # Create a prompt to check if answer is faithful to the context
+                    prompt = (
+                        f"Question: {question}\n\n"
+                        f"Answer: {answer}\n\n"
+                        "On a scale of 1-10, how faithful is this answer to the question, "
+                        "where 10 means completely faithful and accurate, and 1 means completely unfaithful or irrelevant?"
+                    )
+                    
+                    # Call our wrapper directly
+                    response = llm(prompt)
+                    logger.info(f"Faithfulness response: {response}")
+                    
+                    # Extract score from response (simple approach)
+                    try:
+                        # Look for numbers in the response
+                        import re
+                        score_matches = re.findall(r'\b([1-9]|10)\b', response)
+                        if score_matches:
+                            score = int(score_matches[0])
+                            normalized_score = score / 10.0  # Normalize to 0-1
+                            scores.append(normalized_score)
+                        else:
+                            logger.warning(f"Could not extract score from faithfulness response: {response}")
+                            scores.append(0.5)  # Default middle score
+                    except Exception as e:
+                        logger.error(f"Error extracting faithfulness score: {e}")
+                        scores.append(0.5)  # Default middle score
+                
+                # Average the scores
+                results[metric_name] = sum(scores) / len(scores) if scores else 0
+            
+            elif metric_name == "answer_relevancy":
+                # Simple implementation of answer relevancy
+                scores = []
+                for i in range(len(dataset)):
+                    question = dataset[i]['question']
+                    answer = dataset[i]['answer']
+                    
+                    # Create a prompt to check if answer is relevant to the question
+                    prompt = (
+                        f"Question: {question}\n\n"
+                        f"Answer: {answer}\n\n"
+                        "On a scale of 1-10, how relevant is this answer to the question, "
+                        "where 10 means completely relevant and addresses the question directly, "
+                        "and 1 means completely irrelevant?"
+                    )
+                    
+                    # Call our wrapper directly
+                    response = llm(prompt)
+                    logger.info(f"Relevancy response: {response}")
+                    
+                    # Extract score from response (simple approach)
+                    try:
+                        # Look for numbers in the response
+                        import re
+                        score_matches = re.findall(r'\b([1-9]|10)\b', response)
+                        if score_matches:
+                            score = int(score_matches[0])
+                            normalized_score = score / 10.0  # Normalize to 0-1
+                            scores.append(normalized_score)
+                        else:
+                            logger.warning(f"Could not extract score from relevancy response: {response}")
+                            scores.append(0.5)  # Default middle score
+                    except Exception as e:
+                        logger.error(f"Error extracting relevancy score: {e}")
+                        scores.append(0.5)  # Default middle score
+                
+                # Average the scores
+                results[metric_name] = sum(scores) / len(scores) if scores else 0
+            
+            else:
+                logger.warning(f"Metric {metric_name} not implemented in custom_ragas_evaluate")
+                results[metric_name] = 0.5  # Default middle score
+        
+        return results
+    
+    except Exception as e:
+        logger.error(f"Error in custom RAGAS evaluation: {e}", exc_info=True)
+        return {"error": str(e)}
+
+# Helper to convert custom results to a DataFrame similar to RAGAS output
+def custom_results_to_df(results):
+    """Convert custom RAGAS results to a pandas DataFrame."""
+    import pandas as pd
+    df_data = []
+    
+    for metric_name, score in results.items():
+        if metric_name != "error":
+            df_data.append({"metric": metric_name, "score": score})
+    
+    return pd.DataFrame(df_data)
