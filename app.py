@@ -696,7 +696,7 @@ def import_qa_data():
     cursor = None
     try:
         # Read the CSV file
-        file_path = 'C:/Users/aakas/OneDrive/Desktop/healthcare_app/medquad.csv'
+        file_path = 'github.com/SinghAakashdeep/Healthcarerepo/main/medquad.csv'
         
         # Start with file size check and initial progress indicators
         import os
